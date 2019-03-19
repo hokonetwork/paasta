@@ -14,7 +14,6 @@ import requests
 import transitions.extensions
 from mypy_extensions import TypedDict
 
-from paasta_tools.slack import get_slack_client
 try:
     from scribereader import scribereader
 except ImportError:
@@ -25,7 +24,16 @@ SCRIBE_ENV = 'uswest1-prod'
 log = logging.getLogger(__name__)
 
 
-def get_slack_blocks_for_initial_deployment(message, last_action=None, status=None, active_button=None):
+def get_slack_blocks_for_deployment(
+    message,
+    last_action=None,
+    status=None,
+    progress=None,
+    active_button=None,
+    available_buttons=["rollback", "forward"],
+):
+
+    button_elements = get_button_elements(available_buttons, active_button=active_button)
     blocks = [
         {
             "type": "section",
@@ -39,15 +47,16 @@ def get_slack_blocks_for_initial_deployment(message, last_action=None, status=No
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"Status: {status}\nLast action: {last_action}",
+                "text": f"State machine: `{status}`\nProgress: {progress}\nLast operator action: {last_action}",
             },
         },
-        {
+    ]
+    if button_elements != []:
+        blocks.append({
             "type": "actions",
             "block_id": "deployment_actions",
-            "elements": get_button_elements(["rollback", "forward"], active_button=active_button),
-        },
-    ]
+            "elements": button_elements,
+        })
     return blocks
 
 
@@ -122,7 +131,7 @@ class ButtonPress():
         self.response_url = event["response_url"]
         # TODO: Handle multiple actions?
         self.action = event["actions"][0]["value"]
-        self.thread_ts = event["container"]["thread_ts"]
+        self.thread_ts = event["container"].get("thread_ts", None)
         self.channel = event["channel"]["name"]
 
     def __repr__(self):
@@ -153,6 +162,7 @@ def is_relevant_event(event):
 
 def get_slack_events():
     if scribereader is None:
+        logging.error("Scribereader unavailable. Not tailing slack events.")
         return
 
     def scribe_tail(queue):
@@ -174,28 +184,9 @@ def get_slack_events():
             line = queue.get(block=True, timeout=0.1)
             event = parse_webhook_event_json(line)
             if is_relevant_event(event):
-                yield line
+                yield event
         except Empty:
             pass
-
-
-def watch_for_slack_webhooks(sc):
-    for event in get_slack_events():
-        buttonpress = event_to_buttonpress(event)
-        followup_message = f"Got it. {buttonpress.username} pressed {buttonpress.action}"
-        sc.post(channels=[buttonpress.channel], message=followup_message, thread_ts=buttonpress.thread_ts)
-        action = buttonpress.action
-        blocks = get_slack_blocks_for_initial_deployment(
-            message="New Message", last_action=action, status=f"Taking action on the {action} button",
-            active_button=action,
-        )
-        buttonpress.update(blocks)
-
-
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.DEBUG)
-    sc = get_slack_client()
-    watch_for_slack_webhooks(sc)
 
 
 class TransitionDefinition(TypedDict):

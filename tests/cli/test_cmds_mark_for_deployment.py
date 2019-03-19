@@ -404,7 +404,7 @@ def test_MarkForDeployProcess_handles_wait_for_deployment_failure(
 
         deploy_info=None,
         deploy_group=None,
-        commit=None,
+        commit='abc1234578912',
         old_git_sha=None,
         git_url=None,
         soa_dir=None,
@@ -425,7 +425,9 @@ def test_MarkForDeployProcess_handles_wait_for_deployment_failure(
 @patch('paasta_tools.cli.cmds.mark_for_deployment.SlackDeployNotifier', autospec=True)
 @patch('paasta_tools.cli.cmds.mark_for_deployment.mark_for_deployment', autospec=True)
 @patch('paasta_tools.cli.cmds.mark_for_deployment.wait_for_deployment', autospec=True)
+@patch('time.sleep', autospec=True)
 def test_MarkForDeployProcess_handles_wait_for_deployment_cancelled(
+    mock_sleep,
     mock_wait_for_deployment,
     mock_mark_for_deployment,
     mock_SlackDeployNotifier,
@@ -439,7 +441,7 @@ def test_MarkForDeployProcess_handles_wait_for_deployment_cancelled(
 
         deploy_info=None,
         deploy_group=None,
-        commit=None,
+        commit='abc123853489',
         old_git_sha=None,
         git_url=None,
         soa_dir=None,
@@ -451,7 +453,9 @@ def test_MarkForDeployProcess_handles_wait_for_deployment_cancelled(
 
     retval = mfdp.run()
 
-    assert mock_mark_for_deployment.call_count == 1
+    # This should happen once for the initial deploy, then once for the rollback.
+    assert mock_mark_for_deployment.call_count == 2
+    # TODO: we should wait for the rollback to finish
     assert mock_wait_for_deployment.call_count == 1
     assert retval == 1
     assert mfdp.state == 'start_rollback'
@@ -472,7 +476,7 @@ def test_MarkForDeployProcess_skips_wait_for_deployment_when_block_is_False(
 
         deploy_info=None,
         deploy_group=None,
-        commit=None,
+        commit='abc123456789',
         old_git_sha=None,
         git_url=None,
         soa_dir=None,
@@ -490,13 +494,13 @@ def test_MarkForDeployProcess_skips_wait_for_deployment_when_block_is_False(
     assert mfdp.state == 'deploying'
 
 
-@patch('paasta_tools.cli.cmds.mark_for_deployment.SlackDeployNotifier', autospec=True)
+@patch('time.sleep', autospec=True)
 @patch('paasta_tools.cli.cmds.mark_for_deployment.mark_for_deployment', autospec=True)
 @patch('paasta_tools.cli.cmds.mark_for_deployment.wait_for_deployment', autospec=True)
 def test_MarkForDeployProcess_goes_to_mfd_failed_when_mark_for_deployment_fails(
     mock_wait_for_deployment,
     mock_mark_for_deployment,
-    mock_SlackDeployNotifier,
+    mock_sleep,
 ):
     mfdp = mark_for_deployment.MarkForDeploymentProcess(
         service='service',
@@ -505,7 +509,7 @@ def test_MarkForDeployProcess_goes_to_mfd_failed_when_mark_for_deployment_fails(
 
         deploy_info=None,
         deploy_group=None,
-        commit=None,
+        commit='abc123456789',
         old_git_sha=None,
         git_url=None,
         soa_dir=None,

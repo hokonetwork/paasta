@@ -66,7 +66,6 @@ from paasta_tools.utils import TimeoutError
 
 DEFAULT_DEPLOYMENT_TIMEOUT = 3600  # seconds
 
-
 log = logging.getLogger(__name__)
 
 
@@ -280,7 +279,7 @@ class SlackDeployNotifier:
         """
         if self.deploy_group_is_set_to_notify(notify_type):
             for channel in channels:
-                resp, = self.sc.post(channels=[channel], message=initial_message, blocks=initial_blocks)
+                resp = self.sc.post(channels=[channel], message=initial_message, blocks=initial_blocks)[0]
 
                 # If we got an error from Slack, fall back to posting it without a thread.
                 thread_ts = resp['message']['ts'] if resp and resp['ok'] else None
@@ -297,13 +296,7 @@ class SlackDeployNotifier:
                     f"*{self.service}* - Marked *{self.commit[:12]}* for deployment on *{self.deploy_group}*.\n"
                     f"{self.authors}"
                 )
-                if self.auto_rollback:
-                    blocks = automatic_rollbacks.get_slack_blocks_for_initial_deployment(
-                        message, last_action="Marked for deployment", status="Waiting for deployment to start",
-                    )
-                    message = None
-                else:
-                    blocks = None
+                blocks = None
                 self._notify_with_thread(
                     notify_type='notify_after_mark',
                     channels=self.channels,
@@ -523,6 +516,34 @@ def paasta_mark_for_deployment(args):
         return ret
 
 
+class Progress():
+    def __init__(self, percent=0, waiting_on=None, eta=None):
+        self.percent = percent
+        self.waiting_on = waiting_on
+
+    def human_readable(self):
+        if self.percent != 0 and self.percent != 100:
+            s = f"{round(self.percent)}% (Waiting on {self.human_waiting_on()})"
+        else:
+            s = f"{round(self.percent)}%"
+        print(s)
+        return s
+
+    def human_waiting_on(self):
+        if self.waiting_on is None:
+            return "N/A"
+        things = []
+        for cluster, queue in self.waiting_on.items():
+            queue_length = len(queue)
+            if queue_length == 0:
+                continue
+            elif queue_length == 1:
+                things.append(f"`{cluster}`: `{queue[0].get_instance()}`")
+            else:
+                things.append(f"`{cluster}`: {len(queue)} instances")
+        return ", ".join(things)
+
+
 class MarkForDeploymentProcess(automatic_rollbacks.DeploymentProcess):
     def __init__(
         self,
@@ -542,37 +563,99 @@ class MarkForDeploymentProcess(automatic_rollbacks.DeploymentProcess):
         self.deploy_group = deploy_group
         self.commit = commit
         self.old_git_sha = old_git_sha
+        self.target_commit = commit
         self.git_url = git_url
         self.auto_rollback = auto_rollback
         self.block = block
         self.soa_dir = soa_dir
         self.timeout = timeout
-
         self.mark_for_deployment_return_code = -1
         self.wait_for_deployment_green_light = Event()
 
-        self.slack_notifier = SlackDeployNotifier(
-            deploy_info=deploy_info, service=service,
-            deploy_group=deploy_group, commit=commit, old_commit=old_git_sha, git_url=git_url,
-            auto_rollback=auto_rollback,
-        )
+        self.human_readable_status = "Waiting on mark-for-deployment to initialize..."
+        self.progress = Progress()
+        self.slack_client = get_slack_client()
+        self.slack_ts = None
+        self.slack_channel = "#test"
+        self.slack_channel_id = None
+        self.active_button = None
+        self.available_buttons = []
+        self.last_action = None
 
+        self.send_initial_slack_message()
+        slack_thread = Thread(target=self.listen_for_slack_events, args=(), daemon=True)
+        slack_thread.start()
+        timer_thread = Thread(target=self.periodically_update_slack, args=(), daemon=True)
+        timer_thread.start()
         super().__init__()
 
+    def periodically_update_slack(self):
+        while True:
+            self.update_slack()
+            time.sleep(20)
+
+    def send_initial_slack_message(self):
+        blocks = automatic_rollbacks.get_slack_blocks_for_deployment(
+            message=self.human_readable_status,
+            last_action=None,
+            status='Uninitialized',
+            active_button=self.active_button,
+            available_buttons=[],
+        )
+        resp, = self.slack_client.post(blocks=blocks, channels=["#test"])
+        self.slack_ts = resp['message']['ts'] if resp and resp['ok'] else None
+        self.slack_channel_id = resp['channel']
+        if resp["ok"] is not True:
+            log.error("Posting to slack failed: {}".format(resp["error"]))
+
+    def update_slack(self):
+        if hasattr(self, 'state'):
+            s = self.state
+        else:
+            s = "Uninitialized"
+        blocks = automatic_rollbacks.get_slack_blocks_for_deployment(
+            message=self.human_readable_status,
+            progress=self.progress.human_readable(),
+            last_action=self.last_action,
+            status=s,
+            active_button=self.active_button,
+            available_buttons=self.available_buttons,
+        )
+        resp = self.slack_client.sc.api_call(
+            "chat.update",
+            channel=self.slack_channel_id,
+            blocks=blocks,
+            ts=self.slack_ts,
+        )
+        if resp["ok"] is not True:
+            log.error("Posting to slack failed: {}".format(resp["error"]))
+
+    def update_slack_thread(self, message):
+        log.debug(f"Updating slack thread with {message}")
+        self.slack_client.post(
+            channels=[self.slack_channel], message=message, thread_ts=self.slack_ts,
+        )
+
+    def update_slack_status(self, message):
+        self.human_readable_status = message
+        self.update_slack()
+
     def on_enter_start_deploy(self):
+        self.update_slack_status(f"Marking `{self.target_commit[:12]}` for deployment for {self.deploy_group}...")
         self.mark_for_deployment_return_code = mark_for_deployment(
             git_url=self.git_url,
             deploy_group=self.deploy_group,
             service=self.service,
-            commit=self.commit,
+            commit=self.target_commit,
         )
-        self.slack_notifier.notify_after_mark(ret=self.mark_for_deployment_return_code)
-        thread = Thread(target=self.listen_for_slack_events, args=(), daemon=True)
-        thread.start()
+        self.available_buttons = ["rollback"]
+        self.update_slack_thread(f"mark-for-deployment finished with exit code {self.mark_for_deployment_return_code}")
         if self.mark_for_deployment_return_code != 0:
+            self.update_slack_status(f"Marking `{self.target_commit[:12]}` for deployment for {self.deploy_group} failed.")  # noqa E501
             log.debug("triggering mfd_failed")
             self.trigger('mfd_failed')
         else:
+            self.update_slack_status(f"Marked `{self.target_commit[:12]}` for {self.deploy_group}.")
             log.debug("triggering mfd_succeeded")
             self.trigger('mfd_succeeded')
 
@@ -609,20 +692,16 @@ class MarkForDeploymentProcess(automatic_rollbacks.DeploymentProcess):
             'dest': 'mfd_failed',
             'trigger': 'mfd_failed',
         }
-
-        if self.auto_rollback:
-            yield {
-                'trigger': 'deploy_cancelled',
-                'source': 'deploying',
-                'dest': 'start_rollback',
-            }
-        else:
-            yield {
-                'trigger': 'deploy_cancelled',
-                'source': 'deploying',
-                'dest': 'deploy_aborted',
-            }
-
+        yield {
+            'source': 'deploying',
+            'dest': 'start_rollback',
+            'trigger': 'deploy_cancelled',
+        }
+        yield {
+            'source': 'start_rollback',
+            'dest': 'deployed',
+            'trigger': 'deploy_finished',
+        }
         yield {
             'source': 'deploying',
             'dest': 'deploy_aborted',
@@ -651,42 +730,46 @@ class MarkForDeploymentProcess(automatic_rollbacks.DeploymentProcess):
     def on_enter_deploying(self):
         # if self.block is true, then deploying is a terminal state so we will promptly exit.
         # Don't bother starting the background thread in this case.
+        self.active_button = "forward"
+        self.update_slack()
         if self.block:
             thread = Thread(target=self.do_wait_for_deployment, args=(), daemon=True)
             thread.start()
 
     def on_exit_deploying(self):
         self.wait_for_deployment_green_light.clear()
+        self.update_slack_thread("Finished waiting for the deployment")
 
     def on_enter_start_rollback(self):
-        if self.old_git_sha == self.commit:
-            paasta_print("Error: --auto-rollback was requested, but the previous sha")
-            paasta_print("is the same that was requested with --commit. Can't rollback")
-            paasta_print("automatically.")
-        else:
-            paasta_print("Auto-Rollback requested. Marking the previous sha")
-            paasta_print(f"({self.deploy_group}) for {self.old_git_sha} as desired.")
-            mark_for_deployment(
-                git_url=self.git_url,
-                deploy_group=self.deploy_group,
-                service=self.service,
-                commit=self.old_git_sha,
-            )
-            self.slack_notifier.notify_after_auto_rollback()
+        self.active_button = "rollback"
+        self.available_buttons = ["rollback"]
+        self.target_commit = self.old_git_sha
+        self.update_slack_status(f"Rolling back ({self.deploy_group}) to {self.old_git_sha}")
+        mark_for_deployment(
+            git_url=self.git_url,
+            deploy_group=self.deploy_group,
+            service=self.service,
+            commit=self.target_commit,
+        )
+        self.update_slack_thread(f"Finished rollback mark-for-deployment to {self.old_git_sha}")
+        self.update_slack_status(f"Waiting for rollback of {self.deploy_group} to {self.old_git_sha} to finish.")
+        self.trigger('deploy_finished')
 
     def on_enter_deploy_aborted(self):
         report_waiting_aborted(self.service, self.deploy_group)
-        self.slack_notifier.notify_after_abort()
+        self.available_buttons = []
+        self.update_slack_status(f"Deploy aborted, but it will still try to converge on {self.target_commit[:12]}")
 
     def do_wait_for_deployment(self):
         try:
             wait_for_deployment(
                 service=self.service,
                 deploy_group=self.deploy_group,
-                git_sha=self.commit,
+                git_sha=self.target_commit,
                 soa_dir=self.soa_dir,
                 timeout=self.timeout,
                 green_light=self.wait_for_deployment_green_light,
+                progress=self.progress,
             )
             self.trigger('deploy_finished')
 
@@ -700,19 +783,28 @@ class MarkForDeploymentProcess(automatic_rollbacks.DeploymentProcess):
             self.trigger('deploy_aborted')
 
     def on_enter_deployed(self):
-        line = f"Deployment of {self.commit} for {self.deploy_group} complete"
+        line = f"Deployment of {self.target_commit[:12]} for {self.deploy_group} complete"
+        self.active_button = None
+        self.available_buttons = []
+        self.update_slack_status(f"Finished deployment of `{self.target_commit[:12]}` to {self.deploy_group}")
         _log(
             service=self.service,
             component='deploy',
             line=line,
             level='event',
         )
-        self.slack_notifier.notify_after_good_deploy()
+        # TODO: better green-lighting
+        os._exit(0)
 
     def listen_for_slack_events(self):
         log.debug("Listening for slack events...")
         for event in automatic_rollbacks.get_slack_events():
             log.debug(f"Got slack event: {event}")
+            buttonpress = automatic_rollbacks.event_to_buttonpress(event)
+            self.update_slack_thread(f"{buttonpress.username} pressed {buttonpress.action}")
+            self.last_action = buttonpress.action
+            if buttonpress.action == "rollback":
+                self.trigger('deploy_cancelled')
 
 
 class ClusterData:
@@ -955,7 +1047,7 @@ def _run_cluster_worker(cluster_data, green_light):
         paasta_print(f"Deploy to {cluster_data.cluster} complete!")
 
 
-def wait_for_deployment(service, deploy_group, git_sha, soa_dir, timeout, green_light=None):
+def wait_for_deployment(service, deploy_group, git_sha, soa_dir, timeout, green_light=None, progress=None):
     # Currently only 'marathon' instances are supported for wait_for_deployment because they
     # are the only thing that are worth waiting on.
     service_configs = PaastaServiceConfigLoader(service=service, soa_dir=soa_dir, load_deployments=False)
@@ -1019,16 +1111,23 @@ def wait_for_deployment(service, deploy_group, git_sha, soa_dir, timeout, green_
             if not green_light.is_set():
                 raise KeyboardInterrupt
 
-            bar.update(total_instances - sum((
+            finished_instances = total_instances - sum((
                 c.instances_queue.qsize()
                 for c in clusters_data
-            )))
+            ))
+            bar.update(finished_instances)
+            if progress is not None:
+                progress.percent = bar.percentage
+                progress.waiting_on = {c.cluster: list(c.instances_queue.queue) for c in clusters_data}
 
             if all((
                 cluster.instances_queue.empty()
                 for cluster in clusters_data
             )):
                 sys.stdout.flush()
+                if progress is not None:
+                    progress.percent = 100.0
+                    progress.waiting_on = None
                 return 0
             else:
                 time.sleep(min(60, timeout))
